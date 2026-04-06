@@ -1,0 +1,350 @@
+"""
+Google Maps Business Scraper (Generalized)
+Uses Playwright (headless browser) to extract business/place details.
+
+Install dependencies:
+    pip install playwright pandas
+    playwright install chromium
+
+Usage examples:
+    python maps_scraper.py "hotels in Kolkata"
+    python maps_scraper.py "restaurants in Mumbai" --max 50
+    python maps_scraper.py "gyms in Delhi" --max 100 --out-csv gyms.csv --out-json gyms.json
+    python maps_scraper.py "cafes in Pune" --no-headless   # watch the browser
+    python maps_scraper.py --help
+"""
+
+import argparse
+import asyncio
+import json
+import csv
+import time
+import re
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+from playwright.async_api import async_playwright, Page
+
+
+# ── CLI Argument Parsing ───────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape Google Maps for any search query.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default="hotels in New York",
+        help='Search query (default: "hotels in New York")',
+    )
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=50,
+        dest="max_results",
+        metavar="N",
+        help="Maximum number of places to scrape (default: 50)",
+    )
+    parser.add_argument(
+        "--out-csv",
+        default="",
+        dest="output_csv",
+        metavar="FILE",
+        help="Output CSV filename (default: auto-generated from query)",
+    )
+    parser.add_argument(
+        "--out-json",
+        default="",
+        dest="output_json",
+        metavar="FILE",
+        help="Output JSON filename (default: auto-generated from query)",
+    )
+    parser.add_argument(
+        "--no-headless",
+        action="store_false",
+        dest="headless",
+        help="Run browser in visible (non-headless) mode",
+    )
+    parser.add_argument(
+        "--scroll-attempts",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max scroll attempts in the results panel (default: 20)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.5,
+        metavar="SECS",
+        help="Polite delay (seconds) between page visits (default: 0.5)",
+    )
+    return parser.parse_args()
+
+
+def default_filename(query: str, ext: str) -> str:
+    """Turn a query string into a safe filename."""
+    safe = re.sub(r"[^\w\s-]", "", query).strip().lower()
+    safe = re.sub(r"[\s]+", "_", safe)
+    return f"{safe}.{ext}"
+
+
+# ── Data Model ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class Place:
+    name:            str            = ""
+    rating:          Optional[str] = None
+    review_count:    Optional[str] = None
+    price_range:     Optional[str] = None
+    address:         Optional[str] = None
+    phone:           Optional[str] = None
+    website:         Optional[str] = None
+    category:        Optional[str] = None
+    hours:           Optional[str] = None
+    amenities:       list           = field(default_factory=list)
+    google_maps_url: Optional[str] = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def clean(text: Optional[str]) -> Optional[str]:
+    return text.strip() if text else None
+
+
+async def safe_text(page: Page, selector: str) -> Optional[str]:
+    try:
+        el = await page.query_selector(selector)
+        return clean(await el.inner_text()) if el else None
+    except Exception:
+        return None
+
+
+async def safe_attr(page: Page, selector: str, attr: str) -> Optional[str]:
+    try:
+        el = await page.query_selector(selector)
+        return clean(await el.get_attribute(attr)) if el else None
+    except Exception:
+        return None
+
+
+# ── Core Scraping Logic ────────────────────────────────────────────────────────
+
+async def scrape_place_details(page: Page, url: str) -> Place:
+    """Visit a Google Maps place page and extract all available details."""
+    place = Place(google_maps_url=url)
+
+    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    await page.wait_for_timeout(2500)
+
+    # ── Name ──────────────────────────────────────────────────────────────────
+    place.name = (
+        await safe_text(page, "h1.DUwDvf")
+        or await safe_text(page, "h1[class*='fontHeadlineLarge']")
+        or "N/A"
+    )
+
+    # ── Rating & reviews ──────────────────────────────────────────────────────
+    place.rating    = await safe_text(page, "div.F7nice span[aria-hidden='true']")
+    reviews_raw     = await safe_text(page, "div.F7nice span[aria-label*='review']")
+    if reviews_raw:
+        place.review_count = re.sub(r"[^\d,]", "", reviews_raw)
+
+    # ── Category ──────────────────────────────────────────────────────────────
+    place.category = await safe_text(page, "button.DkEaL")
+
+    # ── Price range ───────────────────────────────────────────────────────────
+    price_btn = await page.query_selector("span[aria-label*='rice']")
+    if price_btn:
+        place.price_range = clean(await price_btn.get_attribute("aria-label"))
+        if place.price_range:
+            place.price_range = place.price_range.replace("Price: ", "")
+
+    # ── Address ───────────────────────────────────────────────────────────────
+    addr_btn = await page.query_selector("button[data-item-id='address']")
+    if addr_btn:
+        place.address = clean(await addr_btn.get_attribute("aria-label"))
+        if place.address:
+            place.address = place.address.replace("Address: ", "")
+
+    # ── Phone ─────────────────────────────────────────────────────────────────
+    phone_btn = await page.query_selector("button[data-item-id*='phone']")
+    if phone_btn:
+        place.phone = clean(await phone_btn.get_attribute("aria-label"))
+        if place.phone:
+            place.phone = place.phone.replace("Phone: ", "")
+
+    # ── Website ───────────────────────────────────────────────────────────────
+    web_btn = await page.query_selector("a[data-item-id='authority']")
+    if web_btn:
+        place.website = clean(await web_btn.get_attribute("href"))
+
+    # ── Hours ─────────────────────────────────────────────────────────────────
+    hours_btn = await page.query_selector("button[data-item-id*='hour']")
+    if hours_btn:
+        place.hours = clean(await hours_btn.get_attribute("aria-label"))
+
+    # ── Amenities / feature chips ─────────────────────────────────────────────
+    chips = await page.query_selector_all("div.E0DTEd span.uEubGf")
+    place.amenities = [
+        clean(await c.inner_text()) for c in chips if await c.inner_text()
+    ]
+
+    return place
+
+
+async def search_and_collect_urls(
+    page: Page,
+    query: str,
+    max_results: int,
+    max_scroll_attempts: int,
+) -> list[str]:
+    """Search Google Maps and collect individual place URLs."""
+    encoded    = query.replace(" ", "+")
+    search_url = f"https://www.google.com/maps/search/{encoded}"
+
+    print(f"[*] Opening Google Maps: {search_url}")
+    await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+    await page.wait_for_timeout(3000)
+
+    urls: list[str] = []
+    seen: set[str]  = set()
+    scroll_attempts  = 0
+
+    results_panel_selector = "div[role='feed']"
+
+    while len(urls) < max_results and scroll_attempts < max_scroll_attempts:
+        links = await page.query_selector_all("a[href*='/maps/place/']")
+        for link in links:
+            href = await link.get_attribute("href")
+            if href and href not in seen:
+                seen.add(href)
+                if "/maps/place/" in href:
+                    clean_url = href.split("?")[0]
+                    if clean_url not in urls:
+                        urls.append(clean_url)
+
+        if len(urls) >= max_results:
+            break
+
+        try:
+            panel = await page.query_selector(results_panel_selector)
+            if panel:
+                await panel.evaluate("el => el.scrollBy(0, 1200)")
+            else:
+                await page.keyboard.press("End")
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1500)
+        scroll_attempts += 1
+        print(
+            f"  Collected {len(urls)} URLs so far… "
+            f"(scroll {scroll_attempts}/{max_scroll_attempts})"
+        )
+
+    return urls[:max_results]
+
+
+# ── Save Results ───────────────────────────────────────────────────────────────
+
+def save_csv(places: list[Place], path: str) -> None:
+    if not places:
+        print("[!] No data to write.")
+        return
+    rows = []
+    for p in places:
+        d = asdict(p)
+        d["amenities"] = "; ".join(p.amenities)
+        rows.append(d)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[✓] CSV saved → {path}")
+
+
+def save_json(places: list[Place], path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([asdict(p) for p in places], f, indent=2, ensure_ascii=False)
+    print(f"[✓] JSON saved → {path}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+async def main(args: argparse.Namespace) -> None:
+    query       = args.query
+    max_results = args.max_results
+    headless    = args.headless
+    delay       = args.delay
+    max_scrolls = args.scroll_attempts
+
+    output_csv  = args.output_csv  or default_filename(query, "csv")
+    output_json = args.output_json or default_filename(query, "json")
+
+    print(f"\n{'='*60}")
+    print(f"  Query      : {query}")
+    print(f"  Max results: {max_results}")
+    print(f"  Output CSV : {output_csv}")
+    print(f"  Output JSON: {output_json}")
+    print(f"  Headless   : {headless}")
+    print(f"{'='*60}\n")
+
+    places: list[Place] = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        page = await context.new_page()
+
+        # Step 1 — collect listing URLs
+        urls = await search_and_collect_urls(page, query, max_results, max_scrolls)
+        print(f"\n[*] Found {len(urls)} place URLs. Scraping details…\n")
+
+        # Step 2 — visit each place page
+        for i, url in enumerate(urls, 1):
+            try:
+                print(f"  [{i}/{len(urls)}] Scraping: {url}")
+                place = await scrape_place_details(page, url)
+                places.append(place)
+                print(
+                    f"       → {place.name} | "
+                    f"⭐ {place.rating} | "
+                    f"📞 {place.phone} | "
+                    f"💰 {place.price_range}"
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                print(f"       ⚠ Failed: {exc}")
+
+        await browser.close()
+
+    # Step 3 — save
+    print(f"\n[*] Scraped {len(places)} places total.\n")
+    save_csv(places,  output_csv)
+    save_json(places, output_json)
+
+    # Quick preview
+    print("\n── Preview (first 3 results) ──────────────────────────────")
+    for p in places[:3]:
+        print(json.dumps(asdict(p), indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    asyncio.run(main(parse_args()))
